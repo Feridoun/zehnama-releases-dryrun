@@ -1,0 +1,140 @@
+# Validate a published Zehnama release, and pull it back to draft if it is
+# wrong.
+#
+# Lives in Zehnama/zehnama-releases as .github/workflows/validate-release.yml.
+# Its source is installer/releases-repo/ in the private source repository;
+# copy it across unchanged (docs/APP_RELEASE_PROCESS.md, "One-time setup").
+#
+# scripts/release.ps1 already verifies the draft before publishing it. This
+# is the second, independent look, from a clean Windows machine, at what
+# GitHub actually serves: exactly one installer plus SHA256SUMS.txt, the
+# checksum, the Authenticode signature and its publisher, the installer's own
+# version, and the pre-release flag. Installed copies make the same checks
+# before installing, so a release that fails here would be refused by every
+# client anyway - turning it back into a draft (invisible to clients) stops
+# them downloading it at all.
+#
+# Needs the repository variables EXPECTED_SIGNER_SUBJECT and
+# EXPECTED_SIGNER_ISSUER (Settings → Secrets and variables → Actions →
+# Variables): the exact certificate subject and issuing CA, as printed by
+# (Get-AuthenticodeSignature <a signed installer>).SignerCertificate.Subject
+# and .Issuer. Installed copies hold an update to both. Unset, every release
+# fails - on purpose.
+#
+# Never delete or move a tag here. Withdrawal is "gh release edit vX --draft=true".
+
+name: Validate release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: validate-release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      # Everything the scripts read comes through the environment, never
+      # through ${{ }} inside a script: a tag name is text someone typed.
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      EXPECTED_SIGNER_SUBJECT: ${{ vars.EXPECTED_SIGNER_SUBJECT }}
+      EXPECTED_SIGNER_ISSUER: ${{ vars.EXPECTED_SIGNER_ISSUER }}
+    steps:
+      - name: Check assets, checksum, signature, version and channel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+
+          # The tag is v<SemVer 2.0>, with no build metadata.
+          $semver = '^v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?)\z'
+          $m = [regex]::Match($tag, $semver)
+          if (-not $m.Success) { throw "Tag '$tag' is not v<SemVer>, without build metadata." }
+          $version = $m.Groups[1].Value
+          $expectPrerelease = $m.Groups[5].Success
+          $exeName = "zehnama_setup_$version.exe"
+
+          $subject = $env:EXPECTED_SIGNER_SUBJECT
+          if ([string]::IsNullOrWhiteSpace($subject)) {
+            throw "The repository variable EXPECTED_SIGNER_SUBJECT is not set; refusing to pass any release (fail closed)."
+          }
+          $issuer = $env:EXPECTED_SIGNER_ISSUER
+          if ([string]::IsNullOrWhiteSpace($issuer)) {
+            throw "The repository variable EXPECTED_SIGNER_ISSUER is not set; refusing to pass any release (fail closed)."
+          }
+
+          # Read the release as it is now, not as the event described it.
+          $json = gh release view $tag --json tagName,isDraft,isPrerelease,assets
+          if ($LASTEXITCODE -ne 0) { throw "gh release view $tag failed." }
+          $release = $json | ConvertFrom-Json
+          if ($release.isDraft) { throw "$tag is a draft." }
+          if ([bool]$release.isPrerelease -ne $expectPrerelease) {
+            throw "$tag is marked pre-release=$($release.isPrerelease), but version $version $(if ($expectPrerelease) { 'has' } else { 'has no' }) pre-release part. A beta is a GitHub pre-release; a stable release is not."
+          }
+
+          # Exactly the installer and its checksum file.
+          $assets = @($release.assets)
+          $names = @($assets | ForEach-Object { $_.name })
+          $exes = @($names | Where-Object { $_ -like '*.exe' })
+          if ($exes.Count -ne 1) { throw "$tag carries $($exes.Count) .exe assets; it must carry exactly one." }
+          if ($exes[0] -cne $exeName) { throw "The installer is '$($exes[0])'; for $tag it must be '$exeName'." }
+          if ($names -cnotcontains 'SHA256SUMS.txt') { throw "$tag has no SHA256SUMS.txt; installed copies never offer it." }
+          if ($assets.Count -ne 2) { throw "$tag carries $($assets.Count) assets ($($names -join ', ')); it must carry exactly $exeName and SHA256SUMS.txt." }
+
+          $dir = Join-Path $env:RUNNER_TEMP 'release'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          gh release download $tag --dir $dir
+          if ($LASTEXITCODE -ne 0) { throw "gh release download $tag failed." }
+          $exePath = Join-Path $dir $exeName
+
+          # Checksum: one sha256sum line naming the installer, matching it.
+          $lines = @(Get-Content -LiteralPath (Join-Path $dir 'SHA256SUMS.txt') | Where-Object { $_.Trim() -ne '' })
+          if ($lines.Count -ne 1) { throw "SHA256SUMS.txt holds $($lines.Count) lines; it must hold exactly one." }
+          $sums = [regex]::Match($lines[0].TrimEnd(), '^([0-9a-f]{64})  (\S+)\z')
+          if (-not $sums.Success) { throw "SHA256SUMS.txt's line is not '<64 lowercase hex>  <file name>'." }
+          if ($sums.Groups[2].Value -cne $exeName) { throw "SHA256SUMS.txt names '$($sums.Groups[2].Value)', not '$exeName'." }
+          $hash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sums.Groups[1].Value -cne $hash) { throw "$exeName's SHA-256 is $hash; SHA256SUMS.txt says $($sums.Groups[1].Value)." }
+
+          # Authenticode: valid, by the expected publisher, timestamped.
+          $sig = Get-AuthenticodeSignature -LiteralPath $exePath
+          if ($sig.Status -ne 'Valid') { throw "$exeName's signature is '$($sig.Status)': $($sig.StatusMessage)" }
+          if ($sig.SignerCertificate.Subject -cne $subject) {
+            throw "$exeName is signed by '$($sig.SignerCertificate.Subject)', not '$subject'."
+          }
+          if ($sig.SignerCertificate.Issuer -cne $issuer) {
+            throw "$exeName's certificate was issued by '$($sig.SignerCertificate.Issuer)', not '$issuer'. Installed copies refuse it: see APP_RELEASE_PROCESS.md, Renewing the certificate."
+          }
+          if (-not $sig.TimeStamperCertificate) { throw "$exeName's signature carries no timestamp." }
+
+          # Version binding: the installer's own ProductVersion is the tag's version.
+          $productVersion = (Get-Item -LiteralPath $exePath).VersionInfo.ProductVersion
+          if ($productVersion -cne $version) {
+            throw "$exeName reports ProductVersion '$productVersion'; the tag says '$version'."
+          }
+
+          Write-Host "$tag is valid: $exeName, SHA-256 $hash, signed by $subject (timestamped), ProductVersion $version, pre-release=$expectPrerelease."
+          "### ${tag}: valid`n`n- ``$exeName``, SHA-256 ``$hash```n- Signed by ``$subject``, timestamped`n- ProductVersion ``$version``, pre-release: $expectPrerelease" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Return the release to draft
+        if: failure()
+        shell: pwsh
+        run: |
+          gh release edit $env:RELEASE_TAG --draft=true
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Could not return $env:RELEASE_TAG to draft. Do it by hand now: gh release edit $env:RELEASE_TAG --repo $env:GH_REPO --draft=true"
+            exit 1
+          }
+          Write-Host "::error::$env:RELEASE_TAG failed validation and is a draft again; installed copies no longer see it. Never delete or move its tag - fix the cause and publish the next version."
+          "### $($env:RELEASE_TAG): failed validation, returned to draft`n`nSee the previous step's log. Never delete or move the tag." |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
